@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+# Xbox/Scuf Visualizer — RIGHT panel, LEFT controller drawing
+# Adds "virtual D-pad buttons" (Up/Down/Left/Right) derived from the hat.
+# Mappings/layout per user:
+#   A=0, B=1, X=3, Y=4
+#   LB=6, RB=7, View/Back=10, Menu/Start=11, Guide=8
+#   L3=13, R3=14
+#   Triggers swapped: LT=axis 5, RT=axis 4
+#   Right stick lowered; ABXY moved right
+#   ABXY turn grey when pressed (letters stay colored)
+
+import sys, pygame
+pygame.init()
+pygame.joystick.init()
+pygame.display.set_caption("Xbox Controller Visualizer")
+
+# -------- Window/layout --------
+W, H   = 1280, 680
+PANEL_W = 420
+MARGIN  = 14
+screen = pygame.display.set_mode((W, H))
+clock  = pygame.time.Clock()
+
+# -------- Colors & fonts --------
+BG      = (245, 246, 248)
+OUTLINE = (200, 205, 210)
+BODY    = (255, 255, 255)
+SHADOW  = (220, 224, 229)
+TXT     = (30, 34, 40)
+DIMTXT  = (90, 96, 105)
+GREEN   = (70, 200, 90)     # A letter
+RED     = (240, 95, 70)     # B letter
+BLUE    = (80, 150, 255)    # X letter
+YELL    = (255, 200, 40)    # Y letter
+ACCENT  = (230, 233, 238)
+GREY_P  = (170, 175, 182)   # pressed fill
+
+font_small  = pygame.font.SysFont(None, 20)
+font_body   = pygame.font.SysFont(None, 24)
+font_medium = pygame.font.SysFont(None, 28)
+font_xbtn   = pygame.font.SysFont(None, 30, bold=True)
+
+# -------- Indices (per your controller) --------
+A_IDX, B_IDX, X_IDX, Y_IDX = 0, 1, 3, 4
+LB_IDX, RB_IDX = 6, 7
+VIEW_IDX, MENU_IDX = 10, 11
+GUIDE_IDX = 8
+L3_IDX, R3_IDX = 13, 14
+
+# Friendly labels for the right panel
+AXIS_LABELS = {
+    0: "Left Stick X (LX)",
+    1: "Left Stick Y (LY)",
+    2: "Right Stick X (RX)",
+    3: "Right Stick Y (RY)",
+    4: "Right Trigger (RT)  [axis 4]",
+    5: "Left Trigger (LT)   [axis 5]",
+}
+BTN_LABELS = {
+    A_IDX: "A (south)", B_IDX: "B (east)", X_IDX: "X (west)", Y_IDX: "Y (north)",
+    LB_IDX: "LB", RB_IDX: "RB",
+    VIEW_IDX: "View / Back", MENU_IDX: "Menu / Start",
+    GUIDE_IDX: "Xbox / Guide",
+    L3_IDX: "L3 (left stick press)", R3_IDX: "R3 (right stick press)",
+}
+HAT_LABELS = {0: "D-Pad (hat 0)"}
+
+# -------- Helpers --------
+def text(s, f=font_body, c=TXT): return f.render(s, True, c)
+def draw_round_rect(surf, rect, color, radius=32):
+    x, y, w, h = rect
+    pygame.draw.rect(surf, color, (x+radius, y, w-2*radius, h))
+    pygame.draw.rect(surf, color, (x, y+radius, w, h-2*radius))
+    pygame.draw.circle(surf, color, (x+radius, y+radius), radius)
+    pygame.draw.circle(surf, color, (x+w-radius, y+radius), radius)
+    pygame.draw.circle(surf, color, (x+radius, y+h-radius), radius)
+    pygame.draw.circle(surf, color, (x+w-radius, y+h-radius), radius)
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+
+# -------- Controller layout (LEFT anchored) --------
+BODY_W, BODY_H = 720, 420
+BODY_LEFT = 40
+BODY_TOP  = H//2 + 40 - BODY_H//2
+BODY_RECT = (BODY_LEFT, BODY_TOP, BODY_W, BODY_H)
+CENTER_X  = BODY_LEFT + BODY_W//2
+CENTER_Y  = BODY_TOP  + BODY_H//2
+
+# “Ears” (trigger housings)
+EAR_W, EAR_H = 120, 120
+L_EAR = (BODY_RECT[0]+70, BODY_RECT[1]-EAR_H+20, EAR_W, EAR_H)
+R_EAR = (BODY_RECT[0]+BODY_W-70-EAR_W, BODY_RECT[1]-EAR_H+20, EAR_W, EAR_H)
+
+# Sticks (Right Stick LOWERED)
+LX, LY, LS_R = BODY_RECT[0]+150, CENTER_Y-30, 56
+RX, RY, RS_R = BODY_RECT[0]+BODY_W-150, CENTER_Y+90, 56   # lowered
+
+# D-pad (LOWERED)
+DPAD_CX, DPAD_CY = BODY_RECT[0]+265, CENTER_Y+100
+DPAD_UP    = pygame.Rect(DPAD_CX-18, DPAD_CY-58, 36, 36)
+DPAD_DOWN  = pygame.Rect(DPAD_CX-18, DPAD_CY+22, 36, 36)
+DPAD_LEFT  = pygame.Rect(DPAD_CX-58, DPAD_CY-18, 36, 36)
+DPAD_RIGHT = pygame.Rect(DPAD_CX+22, DPAD_CY-18, 36, 36)
+DPAD_CENTER= pygame.Rect(DPAD_CX-18, DPAD_CY-18, 36, 36)
+
+# ABXY (MOVED RIGHT)
+ABXY_CX, ABXY_CY = BODY_RECT[0]+BODY_W-160, CENTER_Y-40   # further right
+BTN_R = 22
+A_POS = (ABXY_CX, ABXY_CY+40)
+B_POS = (ABXY_CX+40, ABXY_CY)
+X_POS = (ABXY_CX-40, ABXY_CY)
+Y_POS = (ABXY_CX, ABXY_CY-40)
+
+# Center cluster
+XBOX_CX, XBOX_CY, XBOX_R = CENTER_X, BODY_RECT[1]+110, 24
+VIEW_POS  = (CENTER_X-70, BODY_RECT[1]+140)  # button 10
+MENU_POS  = (CENTER_X+70, BODY_RECT[1]+140)  # button 11
+
+# Bumpers & trigger bars
+LB_RECT = pygame.Rect(BODY_RECT[0]+110, BODY_RECT[1]+30, 170, 26)                    # btn 6
+RB_RECT = pygame.Rect(BODY_RECT[0]+BODY_W-110-170, BODY_RECT[1]+30, 170, 26)         # btn 7
+LT_BAR  = pygame.Rect(L_EAR[0]+10, L_EAR[1]+20, EAR_W-20, 12)                        # axis 5
+RT_BAR  = pygame.Rect(R_EAR[0]+10, R_EAR[1]+20, EAR_W-20, 12)                        # axis 4
+
+# -------- Drawing pieces --------
+def stick_dot(cx, cy, radius, ax, ay):
+    inner_r = radius - 16
+    dx = clamp(ax, -1, 1) * (inner_r-6)
+    dy = clamp(ay, -1, 1) * (inner_r-6)
+    pygame.draw.circle(screen, (230, 233, 238), (cx, cy), radius)
+    pygame.draw.circle(screen, (180, 185, 192), (cx, cy), radius, 3)
+    pygame.draw.circle(screen, (215, 219, 225), (cx+int(dx), cy+int(dy)), 14)
+
+def ring_button(pos, radius, pressed=False, label=None, base_fill=BODY,
+                pressed_fill=GREY_P, label_color=TXT):
+    fill = pressed_fill if pressed else base_fill
+    pygame.draw.circle(screen, fill, pos, radius)
+    pygame.draw.circle(screen, OUTLINE, pos, radius, 3)
+    if label:
+        t = font_xbtn.render(label, True, label_color)
+        screen.blit(t, t.get_rect(center=pos))
+
+def draw_body():
+    screen.fill(BG)
+    shadow = pygame.Surface((BODY_W, BODY_H), pygame.SRCALPHA)
+    draw_round_rect(shadow, (0, 0, BODY_W, BODY_H), (*SHADOW, 120), 60)
+    screen.blit(shadow, (BODY_RECT[0], BODY_RECT[1]+6))
+    draw_round_rect(screen, BODY_RECT, BODY, 60)
+    pygame.draw.rect(screen, BODY, L_EAR, border_radius=28)
+    pygame.draw.rect(screen, BODY, R_EAR, border_radius=28)
+    pygame.draw.rect(screen, OUTLINE, L_EAR, 2, border_radius=28)
+    pygame.draw.rect(screen, OUTLINE, R_EAR, 2, border_radius=28)
+    pygame.draw.rect(screen, OUTLINE, BODY_RECT, 3, border_radius=60)
+
+def draw_center_buttons(btn):
+    pygame.draw.circle(screen, BODY, (XBOX_CX, XBOX_CY), XBOX_R)
+    pygame.draw.circle(screen, OUTLINE, (XBOX_CX, XBOX_CY), XBOX_R, 3)
+    if btn.get(GUIDE_IDX, 0): pygame.draw.circle(screen, (120, 220, 110), (XBOX_CX, XBOX_CY), XBOX_R-10)
+    for (cx, cy), idx, glyph in [(VIEW_POS,VIEW_IDX,"≡"), (MENU_POS,MENU_IDX,"●")]:
+        r = 16
+        col = GREY_P if btn.get(idx,0) else ACCENT
+        pygame.draw.circle(screen, col, (cx, cy), r)
+        pygame.draw.circle(screen, OUTLINE, (cx, cy), r, 2)
+        g = text(glyph, font_small); screen.blit(g, g.get_rect(center=(cx, cy)))
+
+def draw_bumpers_triggers(btn, axes):
+    pygame.draw.rect(screen, ACCENT, LB_RECT, border_radius=8)
+    pygame.draw.rect(screen, ACCENT, RB_RECT, border_radius=8)
+    if btn.get(LB_IDX,0): pygame.draw.rect(screen, GREY_P, LB_RECT, border_radius=8)
+    if btn.get(RB_IDX,0): pygame.draw.rect(screen, GREY_P, RB_RECT, border_radius=8)
+    pygame.draw.rect(screen, OUTLINE, LB_RECT, 2, border_radius=8)
+    pygame.draw.rect(screen, OUTLINE, RB_RECT, 2, border_radius=8)
+    screen.blit(text("LB", font_small), (LB_RECT.x+8, LB_RECT.y+4))
+    screen.blit(text("RB", font_small), (RB_RECT.x+RB_RECT.w-28, RB_RECT.y+4))
+
+    # triggers (LT axis 5, RT axis 4) normalized to 0..1
+    def tnorm(v):
+        if v < -0.001: return (v + 1.0) / 2.0
+        return 0.0 if v < 0.0 else (v if v <= 1.0 else 1.0)
+    LT_val = tnorm(axes.get(5, 0.0))
+    RT_val = tnorm(axes.get(4, 0.0))
+
+    pygame.draw.rect(screen, ACCENT, LT_BAR, border_radius=6)
+    pygame.draw.rect(screen, ACCENT, RT_BAR, border_radius=6)
+    if LT_val > 0:
+        fill = LT_BAR.copy(); fill.width = int(LT_BAR.width * LT_val)
+        pygame.draw.rect(screen, GREY_P, fill, border_radius=6)
+    if RT_val > 0:
+        fill = RT_BAR.copy(); fill.width = int(RT_BAR.width * RT_val)
+        pygame.draw.rect(screen, GREY_P, fill, border_radius=6)
+    pygame.draw.rect(screen, OUTLINE, LT_BAR, 2, border_radius=6)
+    pygame.draw.rect(screen, OUTLINE, RT_BAR, 2, border_radius=6)
+    screen.blit(text("LT", font_small), (LT_BAR.x, LT_BAR.y-16))
+    screen.blit(text("RT", font_small), (RT_BAR.x, RT_BAR.y-16))
+
+def draw_dpad(hv):
+    u, d, l, r = hv[1]>0, hv[1]<0, hv[0]<0, hv[0]>0
+    def pad(rect, on):
+        pygame.draw.rect(screen, GREY_P if on else ACCENT, rect, border_radius=6)
+        pygame.draw.rect(screen, OUTLINE, rect, 2, border_radius=6)
+    pad(DPAD_UP, u); pad(DPAD_DOWN, d); pad(DPAD_LEFT, l); pad(DPAD_RIGHT, r)
+    pygame.draw.rect(screen, ACCENT, DPAD_CENTER, border_radius=6)
+    pygame.draw.rect(screen, OUTLINE, DPAD_CENTER, 2, border_radius=6)
+
+def draw_sticks(ax, btn):
+    stick_dot(LX, LY, LS_R, ax.get(0,0.0), ax.get(1,0.0))
+    stick_dot(RX, RY, RS_R, ax.get(2,0.0), ax.get(3,0.0))
+    if btn.get(L3_IDX,0): pygame.draw.circle(screen, (120,220,110), (LX, LY), 10)
+    if btn.get(R3_IDX,0): pygame.draw.circle(screen, (120,220,110), (RX, RY), 10)
+
+def draw_abxy(btn):
+    ring_button(A_POS, BTN_R, pressed=btn.get(A_IDX,0), label="A", label_color=GREEN)
+    ring_button(B_POS, BTN_R, pressed=btn.get(B_IDX,0), label="B", label_color=RED)
+    ring_button(X_POS, BTN_R, pressed=btn.get(X_IDX,0), label="X", label_color=BLUE)
+    ring_button(Y_POS, BTN_R, pressed=btn.get(Y_IDX,0), label="Y", label_color=YELL)
+
+def hat_to_buttons(hv):
+    """Convert (x,y) hat to four booleans like real buttons."""
+    return {
+        "DPad Up":    hv[1] > 0,
+        "DPad Down":  hv[1] < 0,
+        "DPad Left":  hv[0] < 0,
+        "DPad Right": hv[0] > 0,
+    }
+
+def draw_overlay_right(name, axes_raw, btns_raw, hats_raw):
+    panel = pygame.Surface((PANEL_W, H-2*MARGIN), pygame.SRCALPHA)
+    pygame.draw.rect(panel, (255,255,255,230), (0,0,PANEL_W,H-2*MARGIN), border_radius=16)
+    pygame.draw.rect(panel, (210,215,220), (0,0,PANEL_W,H-2*MARGIN), 2, border_radius=16)
+    panel.blit(text("Inputs — live values (right)", font_medium), (14, 10))
+    panel.blit(text(f"Controller: {name}", font_small, DIMTXT), (14, 42))
+
+    y = 70
+    panel.blit(text("Axes:", font_body), (14, y)); y += 24
+    for i in sorted(axes_raw.keys()):
+        v = axes_raw[i]
+        label = AXIS_LABELS.get(i, "—")
+        panel.blit(text(f"Axis {i}: {v:+.3f}   {label}", font_small), (20, y)); y += 18
+
+    y += 8
+    panel.blit(text("Buttons:", font_body), (14, y)); y += 24
+    for i in sorted(btns_raw.keys()):
+        v = btns_raw[i]
+        label = BTN_LABELS.get(i, "—")
+        panel.blit(text(f"Btn {i}: {'1' if v else '0'}   {label}", font_small), (20, y)); y += 18
+
+    y += 8
+    panel.blit(text("D-Pad (virtual buttons):", font_body), (14, y)); y += 24
+    if 0 in hats_raw:
+        virt = hat_to_buttons(hats_raw[0])
+    else:
+        virt = {"DPad Up":False,"DPad Down":False,"DPad Left":False,"DPad Right":False}
+    for k in ["DPad Up","DPad Down","DPad Left","DPad Right"]:
+        panel.blit(text(f"{k}: {'1' if virt[k] else '0'}", font_small), (20, y)); y += 18
+
+    y += 8
+    panel.blit(text("Hats (raw):", font_body), (14, y)); y += 24
+    if not hats_raw:
+        panel.blit(text("(none detected)", font_small, DIMTXT), (20, y))
+    else:
+        for i in sorted(hats_raw.keys()):
+            hv = hats_raw[i]
+            panel.blit(text(f"Hat {i}: {hv}   {HAT_LABELS.get(i,'—')}", font_small), (20, y)); y += 18
+
+    screen.blit(panel, (W - MARGIN - PANEL_W, MARGIN))
+
+# -------- Controller detection --------
+def get_controller():
+    if pygame.joystick.get_count() == 0: return None
+    js = pygame.joystick.Joystick(0); js.init(); return js
+
+joystick = get_controller()
+joy_name = joystick.get_name() if joystick else "No controller found"
+
+# -------- Main loop --------
+deadzone = 0.06
+running = True
+while running:
+    for e in pygame.event.get():
+        if e.type == pygame.QUIT: running = False
+        elif e.type == pygame.JOYDEVICEADDED and joystick is None:
+            joystick = get_controller(); joy_name = joystick.get_name() if joystick else "No controller found"
+        elif e.type == pygame.JOYDEVICEREMOVED and joystick and e.instance_id == joystick.get_instance_id():
+            joystick = None; joy_name = "No controller found"
+
+    axes, btns, hats = {}, {}, {}
+    if joystick:
+        for i in range(joystick.get_numaxes()):
+            v = joystick.get_axis(i)
+            axes[i] = 0.0 if abs(v) < deadzone else v
+        for i in range(joystick.get_numbuttons()):
+            btns[i] = joystick.get_button(i)
+        for i in range(joystick.get_numhats()):
+            hats[i] = joystick.get_hat(i)
+
+    # Draw
+    draw_body()
+    draw_bumpers_triggers(btns, axes)
+    draw_dpad(hats.get(0, (0,0)))
+    draw_sticks(axes, btns)
+    draw_abxy(btns)
+    draw_center_buttons(btns)
+
+    # captions
+    screen.blit(text("Left Stick",  font_small, DIMTXT), (LX-40, LY+LS_R+12))
+    screen.blit(text("Right Stick", font_small, DIMTXT), (RX-44, RY+RS_R+12))
+    screen.blit(text("D-Pad",       font_small, DIMTXT), (DPAD_CX-18, DPAD_CY+58))
+    screen.blit(text("ABXY",        font_small, DIMTXT), (ABXY_CX-18, ABXY_CY+62))
+
+    draw_overlay_right(joy_name, axes, btns, hats)
+
+    pygame.display.flip()
+    clock.tick(120)
+
+pygame.quit()
+sys.exit()
+
