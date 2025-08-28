@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+# Servo from left-stick HEADING (uses both X & Y).
+# - GPIO 17 drives a single positional servo (0..180° range).
+# - Left stick angle (full 360°) is mapped to servo 0..180° (wraps every 360°).
+# - Launches your "controller mapping.py" visualizer alongside (same controller).
+#
+# Requirements:
+#   sudo apt-get install pigpio
+#   sudo systemctl enable pigpiod && sudo systemctl start pigpiod
+#   pip3 install pygame pigpio
+
+import os, sys, atexit, signal, subprocess, math
+from typing import Optional
+from pathlib import Path
+
+import pygame
+import pigpio
+
+# ====== CONFIG ======
+MAPPING_BASENAME = "controller mapping.py"   # your visualizer filename
+PYTHON_BIN       = sys.executable
+
+SERVO_GPIO       = 17        # BCM pin
+SERVO_MIN_US     = 500       # adjust for your servo
+SERVO_MAX_US     = 2500
+SERVO_MIN_DEG    = 0         # mechanical limits
+SERVO_MAX_DEG    = 180
+
+DEADZONE         = 0.10      # stick noise
+INVERT_Y         = True      # stick up is positive angle (screen-space)
+SMOOTHING        = 0.28      # 0..1; higher = smoother (more lag)
+HEADING_OFFSET   = 0.0       # degrees; rotate mapping if your horn is misaligned
+
+WINDOW_W, WINDOW_H = 520, 130
+FPS              = 120
+
+# ====== helpers ======
+def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
+def lerp(a, b, t):     return a + (b - a) * t
+
+def script_base_dir() -> Path:
+    f = globals().get("__file__")
+    if f: return Path(f).resolve().parent
+    if sys.argv and sys.argv[0]: return Path(sys.argv[0]).resolve().parent
+    return Path.cwd()
+
+def mapping_path() -> Path:
+    override = os.environ.get("MAPPING_PATH")
+    return Path(override).expanduser().resolve() if override else (script_base_dir() / MAPPING_BASENAME).resolve()
+
+def launch_mapping() -> Optional[subprocess.Popen]:
+    mpath = mapping_path()
+    if not mpath.exists():
+        print(f"[info] '{mpath.name}' not found; running servo only.", file=sys.stderr)
+        return None
+    try:
+        return subprocess.Popen([PYTHON_BIN, str(mpath)],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except Exception as e:
+        print(f"[warn] Couldn't launch mapping UI: {e}", file=sys.stderr)
+        return None
+
+def kill_mapping(proc: Optional[subprocess.Popen]) -> None:
+    if not proc: return
+    try: os.killpg(proc.pid, signal.SIGTERM)
+    except Exception: pass
+
+def init_js() -> Optional[pygame.joystick.Joystick]:
+    pygame.joystick.init()
+    if pygame.joystick.get_count() == 0: return None
+    js = pygame.joystick.Joystick(0); js.init(); return js
+
+def axis_pair(js) -> tuple[float, float]:
+    if not js: return 0.0, 0.0
+    lx = js.get_axis(0)
+    ly = js.get_axis(1)
+    if abs(lx) < DEADZONE: lx = 0.0
+    if abs(ly) < DEADZONE: ly = 0.0
+    if INVERT_Y: ly = -ly
+    return lx, ly
+
+def heading_deg(lx: float, ly: float) -> Optional[float]:
+    """Return heading in [0,360) from left stick, or None if inside deadzone radius."""
+    r = math.hypot(lx, ly)
+    if r < DEADZONE: return None
+    # (1,0) -> 0°, (0,1)->90°, (-1,0)->180°, (0,-1)->270°
+    theta = math.degrees(math.atan2(ly, lx))  # (-180,180]
+    return (theta + 360.0) % 360.0
+
+def heading_to_servo_deg(theta: float) -> float:
+    """Map full 360° joystick heading to 0..180° servo sweep (wraps)."""
+    theta = (theta + HEADING_OFFSET) % 360.0
+    servo_deg = theta / 2.0  # compress 360 -> 180
+    return clamp(servo_deg, SERVO_MIN_DEG, SERVO_MAX_DEG)
+
+def deg_to_pulse(deg: float) -> int:
+    span_deg = SERVO_MAX_DEG - SERVO_MIN_DEG
+    span_us  = SERVO_MAX_US  - SERVO_MIN_US
+    t = (clamp(deg, SERVO_MIN_DEG, SERVO_MAX_DEG) - SERVO_MIN_DEG) / span_deg
+    return int(round(SERVO_MIN_US + t * span_us))
+
+# ====== main ======
+def main():
+    mapping_proc = launch_mapping()
+    atexit.register(kill_mapping, mapping_proc)
+
+    pi = pigpio.pi()
+    if not pi.connected:
+        print("Error: pigpio not running. Try: sudo systemctl start pigpiod", file=sys.stderr)
+        sys.exit(1)
+    atexit.register(pi.stop)
+
+    pygame.init()
+    pygame.display.set_caption("Left-stick → Heading → Servo (GPIO 17)")
+    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    font = pygame.font.SysFont(None, 22)
+    clock = pygame.time.Clock()
+
+    js = init_js()
+    if js is None:
+        print("No controller detected.", file=sys.stderr)
+        return
+
+    # center servo
+    target_deg = (SERVO_MIN_DEG + SERVO_MAX_DEG) * 0.5
+    cur_deg    = target_deg
+    pi.set_servo_pulsewidth(SERVO_GPIO, deg_to_pulse(cur_deg))
+
+    running = True
+    try:
+        while running:
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    running = False
+                elif e.type == pygame.JOYDEVICEADDED and js is None:
+                    js = init_js()
+                elif e.type == pygame.JOYDEVICEREMOVED and js and e.instance_id == js.get_instance_id():
+                    js = None
+
+            lx, ly = axis_pair(js)
+            theta = heading_deg(lx, ly)
+            if theta is not None:
+                target_deg = heading_to_servo_deg(theta)
+            # smooth for stability
+            cur_deg = lerp(cur_deg, target_deg, SMOOTHING)
+            pi.set_servo_pulsewidth(SERVO_GPIO, deg_to_pulse(cur_deg))
+
+            # tiny HUD
+            screen.fill((245,246,248))
+            lines = [
+                f"Visualizer: {mapping_path().name if mapping_proc else '— (not launched)'}",
+                f"LX:{lx:+.3f}  LY:{ly:+.3f}  |  heading: {theta:6.1f}°" if theta is not None else "heading: —",
+                f"servo: {cur_deg:6.1f}°  →  {deg_to_pulse(cur_deg)} µs  @ GPIO {SERVO_GPIO}",
+                "Tip: set HEADING_OFFSET to align mechanical center."
+            ]
+            for i,s in enumerate(lines):
+                screen.blit(font.render(s, True, (30,34,40)), (10, 10 + i*26))
+            pygame.display.flip()
+            clock.tick(FPS)
+
+    finally:
+        pi.set_servo_pulsewidth(SERVO_GPIO, 0)  # release
+        kill_mapping(mapping_proc)
+        pygame.quit()
+
+if __name__ == "__main__":
+    main()
+
